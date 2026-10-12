@@ -1,0 +1,1010 @@
+import React, {StrictMode} from 'react';
+import {render, renderHook, act, waitFor} from '@testing-library/react';
+
+import {CheckoutElementsProvider} from './CheckoutElementsProvider';
+import {
+  useCheckout,
+  useCheckoutElements,
+  useCheckoutForm,
+} from './CheckoutContext';
+import {Elements} from '../../components/Elements';
+import {useStripe} from '../../components/useStripe';
+import * as mocks from '../../../test/mocks';
+import makeDeferred from '../../../test/makeDeferred';
+
+describe('CheckoutElementsProvider', () => {
+  let mockStripe: any;
+  let mockStripePromise: any;
+  let mockCheckoutSdk: any;
+  let consoleError: any;
+  let consoleWarn: any;
+  let mockCheckoutActions: any;
+
+  beforeEach(() => {
+    mockCheckoutSdk = mocks.mockCheckoutSdk();
+    mockCheckoutActions = mocks.mockCheckoutActions();
+    mockCheckoutSdk.loadActions.mockResolvedValue({
+      type: 'success',
+      actions: mockCheckoutActions,
+    });
+
+    mockStripe = mocks.mockStripe();
+    mockStripe.initCheckoutElementsSdk.mockReturnValue(mockCheckoutSdk);
+    mockStripePromise = Promise.resolve(mockStripe);
+
+    jest.spyOn(console, 'error');
+    jest.spyOn(console, 'warn');
+    consoleError = console.error;
+    consoleWarn = console.warn;
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  const fakeClientSecret = 'cs_123';
+
+  const wrapper = ({stripe, clientSecret, children}: any) => (
+    <CheckoutElementsProvider
+      stripe={stripe === undefined ? mockStripe : stripe}
+      options={{
+        clientSecret: clientSecret || fakeClientSecret,
+      }}
+    >
+      {children}
+    </CheckoutElementsProvider>
+  );
+
+  describe.each([false, true])(
+    'initialization errors (StrictMode: %s)',
+    (strictMode) => {
+      const renderProvider = (stripe: any) => {
+        const TestComponent = () => {
+          const checkout = useCheckoutElements();
+          return (
+            <div>
+              {checkout.type === 'error'
+                ? checkout.error.message
+                : checkout.type}
+            </div>
+          );
+        };
+        const provider = (
+          <CheckoutElementsProvider
+            stripe={stripe}
+            options={{clientSecret: fakeClientSecret}}
+          >
+            <TestComponent />
+          </CheckoutElementsProvider>
+        );
+        return render(
+          strictMode ? <StrictMode>{provider}</StrictMode> : provider
+        );
+      };
+
+      it('exposes a rejected Stripe promise through useCheckoutElements', async () => {
+        const deferred = makeDeferred();
+        const error = new Error('Failed to load Stripe.js');
+        const result = renderProvider(deferred.promise);
+
+        expect(result.getByText('loading')).toBeInTheDocument();
+        await act(() => deferred.reject(error));
+
+        expect(result.getByText(error.message)).toBeInTheDocument();
+      });
+
+      it('exposes validation errors from a resolved Stripe promise', async () => {
+        const deferred = makeDeferred();
+        const result = renderProvider(deferred.promise);
+
+        await act(() => deferred.resolve({}));
+
+        expect(
+          result.getByText(
+            /Invalid prop `stripe` supplied to `CheckoutElementsProvider`/
+          )
+        ).toBeInTheDocument();
+      });
+
+      describe.each(['sync', 'async'])(
+        'with a %s Stripe prop',
+        (stripeType) => {
+          it.each(['initCheckoutElementsSdk', 'loadActions'])(
+            'exposes a synchronous exception from %s',
+            async (method) => {
+              const error = new Error(`${method} failed`);
+              const target =
+                method === 'initCheckoutElementsSdk'
+                  ? mockStripe
+                  : mockCheckoutSdk;
+              target[method].mockImplementation(() => {
+                throw error;
+              });
+
+              const result = renderProvider(
+                stripeType === 'sync' ? mockStripe : mockStripePromise
+              );
+
+              await waitFor(() =>
+                expect(result.getByText(error.message)).toBeInTheDocument()
+              );
+              expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(
+                1
+              );
+            }
+          );
+        }
+      );
+
+      it('still exposes a rejected loadActions promise', async () => {
+        const deferred = makeDeferred();
+        const error = new Error('Failed to load actions');
+        mockCheckoutSdk.loadActions.mockReturnValue(deferred.promise);
+        const result = renderProvider(mockStripe);
+
+        await act(() => deferred.reject(error));
+
+        expect(result.getByText(error.message)).toBeInTheDocument();
+      });
+
+      it.each(['stripe', 'loadActions'])(
+        'handles a rejected %s promise after unmount',
+        async (source) => {
+          const deferred = makeDeferred();
+          if (source === 'loadActions') {
+            mockCheckoutSdk.loadActions.mockReturnValue(deferred.promise);
+          }
+          const result = renderProvider(
+            source === 'stripe' ? deferred.promise : mockStripe
+          );
+
+          result.unmount();
+          await act(() => deferred.reject(new Error('Initialization failed')));
+
+          expect(consoleError).not.toHaveBeenCalled();
+        }
+      );
+    }
+  );
+
+  describe('interaction with useStripe()', () => {
+    it('works with a Stripe instance', async () => {
+      const deferred = makeDeferred();
+      mockCheckoutSdk.loadActions.mockReturnValue(deferred.promise);
+      const {result} = renderHook(() => useStripe(), {
+        wrapper,
+        initialProps: {stripe: mockStripe},
+      });
+
+      expect(result.current).toBe(mockStripe);
+
+      await act(() =>
+        deferred.resolve({type: 'success', actions: mockCheckoutActions})
+      );
+
+      expect(result.current).toBe(mockStripe);
+    });
+
+    it('works when updating null to a Stripe instance', async () => {
+      const deferred = makeDeferred();
+      let stripeValue: any = null;
+      mockCheckoutSdk.loadActions.mockReturnValue(deferred.promise);
+      const {result, rerender} = renderHook(() => useStripe(), {
+        wrapper: ({children}) => wrapper({stripe: stripeValue, children}),
+      });
+
+      expect(result.current).toBe(null);
+
+      stripeValue = mockStripe;
+      rerender();
+      expect(result.current).toBe(mockStripe);
+
+      await act(() =>
+        deferred.resolve({type: 'success', actions: mockCheckoutActions})
+      );
+
+      await waitFor(() => {
+        expect(result.current).toBe(mockStripe);
+      });
+    });
+
+    it('works with a Promise', async () => {
+      const deferred = makeDeferred();
+      const {result} = renderHook(() => useStripe(), {
+        wrapper: ({children}) => wrapper({stripe: deferred.promise, children}),
+      });
+
+      expect(result.current).toBe(null);
+
+      await act(() => deferred.resolve(mockStripe));
+
+      expect(result.current).toBe(mockStripe);
+    });
+  });
+
+  describe('interaction with useCheckout()', () => {
+    it('works when loadActions resolves', async () => {
+      const stripe: any = mocks.mockStripe();
+      const deferred = makeDeferred();
+      const mockSdk = mocks.mockCheckoutSdk();
+      const testMockCheckoutActions = mocks.mockCheckoutActions();
+      const testMockSession = mocks.mockCheckoutSession();
+
+      mockSdk.loadActions.mockReturnValue(deferred.promise);
+      stripe.initCheckoutElementsSdk.mockReturnValue(mockSdk);
+
+      const {result} = renderHook(() => useCheckout(), {
+        wrapper: ({children}) => wrapper({stripe, children}),
+      });
+
+      expect(result.current).toEqual({type: 'loading'});
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+
+      await act(() =>
+        deferred.resolve({
+          type: 'success',
+          actions: testMockCheckoutActions,
+        })
+      );
+
+      const {on: _on, loadActions: _loadActions, ...elementsMethods} = mockSdk;
+      const {getSession: _getSession, ...otherCheckoutActions} =
+        testMockCheckoutActions;
+
+      const expectedCheckout = {
+        ...elementsMethods,
+        ...otherCheckoutActions,
+        ...testMockSession,
+      };
+
+      expect(result.current).toEqual({
+        type: 'success',
+        checkout: expectedCheckout,
+      });
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+    });
+
+    it('works when loadActions rejects', async () => {
+      const stripe: any = mocks.mockStripe();
+      const deferred = makeDeferred();
+      const mockSdk = mocks.mockCheckoutSdk();
+      mockSdk.loadActions.mockReturnValue(deferred.promise);
+      stripe.initCheckoutElementsSdk.mockReturnValue(mockSdk);
+
+      const {result} = renderHook(() => useCheckout(), {
+        wrapper: ({children}) => wrapper({stripe, children}),
+      });
+
+      expect(result.current).toEqual({type: 'loading'});
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+
+      await act(() =>
+        deferred.reject(new Error('initCheckoutElementsSdk error'))
+      );
+
+      expect(result.current).toEqual({
+        type: 'error',
+        error: new Error('initCheckoutElementsSdk error'),
+      });
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not set context if Promise resolves after CheckoutElementsProvider is unmounted', async () => {
+      const result = render(
+        <CheckoutElementsProvider
+          stripe={mockStripePromise}
+          options={{clientSecret: Promise.resolve(fakeClientSecret)}}
+        >
+          {null}
+        </CheckoutElementsProvider>
+      );
+
+      result.unmount();
+      await act(() => mockStripePromise);
+
+      expect(consoleError).not.toHaveBeenCalled();
+    });
+
+    // Regression guard for the public Elements SDK surface documented at
+    // https://docs.stripe.com/sdks/stripejs-react. Any accidental narrowing
+    // of StripeCheckoutValue that drops these methods would break every
+    // <CheckoutElementsProvider> consumer calling them from useCheckout().
+    it('exposes every action method returned by loadActions on useCheckout().checkout', async () => {
+      const testMockCheckoutActions = mocks.mockCheckoutActions();
+      mockCheckoutSdk.loadActions.mockResolvedValue({
+        type: 'success',
+        actions: testMockCheckoutActions,
+      });
+
+      const {result} = renderHook(() => useCheckout(), {
+        wrapper,
+        initialProps: {stripe: mockStripe},
+      });
+
+      await act(async () => {});
+
+      if (result.current.type !== 'success') {
+        throw new Error(
+          `expected success, got ${JSON.stringify(result.current)}`
+        );
+      }
+      const {checkout} = result.current;
+
+      // Every action key from the SDK (except getSession, whose fields are
+      // spread onto checkout as session data) must be a function. Derived
+      // from the mock so this stays honest if the shared mock is updated.
+      const {getSession: _getSession, ...expectedActionKeys} =
+        testMockCheckoutActions;
+      Object.keys(expectedActionKeys).forEach((key) => {
+        expect(typeof (checkout as any)[key]).toBe('function');
+      });
+    });
+
+    // Mirrors the regression guard above for useCheckoutElements(), which
+    // returns the same Elements-shaped surface but with a type that makes
+    // the contract explicit for Elements consumers.
+    it('useCheckoutElements() exposes every action method returned by loadActions', async () => {
+      const testMockCheckoutActions = mocks.mockCheckoutActions();
+      mockCheckoutSdk.loadActions.mockResolvedValue({
+        type: 'success',
+        actions: testMockCheckoutActions,
+      });
+
+      const {result} = renderHook(() => useCheckoutElements(), {
+        wrapper,
+        initialProps: {stripe: mockStripe},
+      });
+
+      await act(async () => {});
+
+      if (result.current.type !== 'success') {
+        throw new Error(
+          `expected success, got ${JSON.stringify(result.current)}`
+        );
+      }
+      const {checkout} = result.current;
+
+      const {getSession: _getSession, ...expectedActionKeys} =
+        testMockCheckoutActions;
+      Object.keys(expectedActionKeys).forEach((key) => {
+        expect(typeof (checkout as any)[key]).toBe('function');
+      });
+    });
+
+    // useCheckoutForm() under the wrong provider must fail loudly at first
+    // render instead of silently returning undefined-shaped actions. The
+    // error must name the expected provider so integrators can self-serve.
+    it('useCheckoutForm() throws when used under <CheckoutElementsProvider>', async () => {
+      consoleError.mockImplementation(() => {});
+      const testMockCheckoutActions = mocks.mockCheckoutActions();
+      mockCheckoutSdk.loadActions.mockResolvedValue({
+        type: 'success',
+        actions: testMockCheckoutActions,
+      });
+
+      const {result} = renderHook(
+        () => {
+          try {
+            return {value: useCheckoutForm(), error: undefined};
+          } catch (e) {
+            return {value: undefined, error: e as Error};
+          }
+        },
+        {
+          wrapper: ({children}) => wrapper({stripe: mockStripe, children}),
+        }
+      );
+
+      await act(async () => {});
+
+      expect(result.current.error?.message).toMatch(
+        /useCheckoutForm\(\) must be used inside <CheckoutFormProvider>/
+      );
+    });
+  });
+
+  describe('stripe prop', () => {
+    it('validates stripe prop type', async () => {
+      consoleError.mockImplementation(() => {});
+
+      const renderWithProp = (stripeProp: unknown) => () => {
+        render(
+          <CheckoutElementsProvider
+            stripe={stripeProp as any}
+            options={{clientSecret: fakeClientSecret}}
+          >
+            <div />
+          </CheckoutElementsProvider>
+        );
+      };
+
+      expect(renderWithProp(undefined)).toThrow(
+        'Invalid prop `stripe` supplied to `CheckoutElementsProvider`.'
+      );
+      expect(renderWithProp(false)).toThrow(
+        'Invalid prop `stripe` supplied to `CheckoutElementsProvider`.'
+      );
+      expect(renderWithProp('foo')).toThrow(
+        'Invalid prop `stripe` supplied to `CheckoutElementsProvider`.'
+      );
+      expect(renderWithProp({foo: 'bar'})).toThrow(
+        'Invalid prop `stripe` supplied to `CheckoutElementsProvider`.'
+      );
+    });
+
+    it('when stripe prop changes from null to a Stripe instance', async () => {
+      const stripe: any = mocks.mockStripe();
+      const deferred = makeDeferred();
+      const mockSdk = mocks.mockCheckoutSdk();
+      const testMockCheckoutActions = mocks.mockCheckoutActions();
+      const testMockSession = mocks.mockCheckoutSession();
+
+      mockSdk.loadActions.mockReturnValue(deferred.promise);
+      stripe.initCheckoutElementsSdk.mockReturnValue(mockSdk);
+
+      let stripeValue: any = null;
+      const {result, rerender} = renderHook(() => useCheckout(), {
+        wrapper: ({children}) => wrapper({stripe: stripeValue, children}),
+      });
+
+      expect(result.current).toEqual({type: 'loading'});
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(0);
+
+      stripeValue = stripe;
+      rerender();
+
+      expect(result.current).toEqual({type: 'loading'});
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+
+      await act(() =>
+        deferred.resolve({
+          type: 'success',
+          actions: testMockCheckoutActions,
+        })
+      );
+
+      const {on: _on, loadActions: _loadActions, ...elementsMethods} = mockSdk;
+      const {getSession: _getSession, ...otherCheckoutActions} =
+        testMockCheckoutActions;
+
+      const expectedCheckout = {
+        ...elementsMethods,
+        ...otherCheckoutActions,
+        ...testMockSession,
+      };
+
+      expect(result.current).toEqual({
+        type: 'success',
+        checkout: expectedCheckout,
+      });
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+    });
+
+    it('when the stripe prop is a Promise', async () => {
+      const stripe: any = mocks.mockStripe();
+      const stripeDeferred = makeDeferred();
+      const deferred = makeDeferred();
+      const mockSdk = mocks.mockCheckoutSdk();
+      const testMockCheckoutActions = mocks.mockCheckoutActions();
+      const testMockSession = mocks.mockCheckoutSession();
+
+      mockSdk.loadActions.mockReturnValue(deferred.promise);
+      stripe.initCheckoutElementsSdk.mockReturnValue(mockSdk);
+
+      const {result} = renderHook(() => useCheckout(), {
+        wrapper: ({children}) =>
+          wrapper({stripe: stripeDeferred.promise, children}),
+      });
+
+      expect(result.current).toEqual({type: 'loading'});
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(0);
+
+      await act(() => stripeDeferred.resolve(stripe));
+
+      expect(result.current).toEqual({type: 'loading'});
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+
+      await act(() =>
+        deferred.resolve({
+          type: 'success',
+          actions: testMockCheckoutActions,
+        })
+      );
+
+      const {on: _on, loadActions: _loadActions, ...elementsMethods} = mockSdk;
+      const {getSession: _getSession, ...otherCheckoutActions} =
+        testMockCheckoutActions;
+
+      const expectedCheckout = {
+        ...elementsMethods,
+        ...otherCheckoutActions,
+        ...testMockSession,
+      };
+
+      expect(result.current).toEqual({
+        type: 'success',
+        checkout: expectedCheckout,
+      });
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+    });
+
+    it('when the stripe prop changes from null to a Promise', async () => {
+      const stripe: any = mocks.mockStripe();
+      const stripeDeferred = makeDeferred();
+      const deferred = makeDeferred();
+      const mockSdk = mocks.mockCheckoutSdk();
+      const testMockCheckoutActions = mocks.mockCheckoutActions();
+      const testMockSession = mocks.mockCheckoutSession();
+
+      mockSdk.loadActions.mockReturnValue(deferred.promise);
+      stripe.initCheckoutElementsSdk.mockReturnValue(mockSdk);
+
+      let stripeValue: any = null;
+      const {result, rerender} = renderHook(() => useCheckout(), {
+        wrapper: ({children}) => wrapper({stripe: stripeValue, children}),
+      });
+
+      expect(result.current).toEqual({type: 'loading'});
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(0);
+
+      stripeValue = stripeDeferred.promise;
+      rerender();
+
+      expect(result.current).toEqual({type: 'loading'});
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(0);
+
+      await act(() => stripeDeferred.resolve(stripe));
+
+      expect(result.current).toEqual({type: 'loading'});
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+
+      await act(() =>
+        deferred.resolve({
+          type: 'success',
+          actions: testMockCheckoutActions,
+        })
+      );
+
+      const {on: _on, loadActions: _loadActions, ...elementsMethods} = mockSdk;
+      const {getSession: _getSession, ...otherCheckoutActions} =
+        testMockCheckoutActions;
+
+      const expectedCheckout = {
+        ...elementsMethods,
+        ...otherCheckoutActions,
+        ...testMockSession,
+      };
+
+      expect(result.current).toEqual({
+        type: 'success',
+        checkout: expectedCheckout,
+      });
+      expect(stripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+    });
+
+    it('when the stripe prop is a Promise(null)', async () => {
+      const stripeDeferred = makeDeferred<any>();
+
+      const {result} = renderHook(() => useCheckout(), {
+        wrapper: ({children}) =>
+          wrapper({stripe: stripeDeferred.promise, children}),
+      });
+
+      expect(result.current).toEqual({type: 'loading'});
+
+      await act(() => stripeDeferred.resolve(null));
+
+      expect(result.current).toEqual({type: 'loading'});
+    });
+
+    it('does not allow changes to an already set Stripe object', async () => {
+      consoleWarn.mockImplementation(() => {});
+      let result: any;
+      act(() => {
+        result = render(
+          <CheckoutElementsProvider
+            stripe={mockStripe}
+            options={{clientSecret: fakeClientSecret}}
+          />
+        );
+      });
+
+      const mockStripe2: any = mocks.mockStripe();
+      act(() => {
+        result.rerender(
+          <CheckoutElementsProvider
+            stripe={mockStripe2}
+            options={{clientSecret: fakeClientSecret}}
+          />
+        );
+      });
+
+      await waitFor(() => {
+        expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+        expect(mockStripe2.initCheckoutElementsSdk).toHaveBeenCalledTimes(0);
+        expect(consoleWarn).toHaveBeenCalledWith(
+          'Unsupported prop change on CheckoutElementsProvider: You cannot change the `stripe` prop after setting it.'
+        );
+      });
+    });
+  });
+
+  it('only calls initCheckoutElementsSdk once and allows changes to elementsOptions appearance after setting the Stripe object', async () => {
+    const result = render(
+      <CheckoutElementsProvider
+        stripe={mockStripe}
+        options={{
+          clientSecret: fakeClientSecret,
+          elementsOptions: {
+            appearance: {theme: 'stripe'},
+          },
+        }}
+      />
+    );
+
+    await waitFor(() => {
+      expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledWith({
+        clientSecret: fakeClientSecret,
+        elementsOptions: {
+          appearance: {theme: 'stripe'},
+        },
+      });
+    });
+
+    act(() => {
+      result.rerender(
+        <CheckoutElementsProvider
+          stripe={mockStripe}
+          options={{
+            clientSecret: fakeClientSecret,
+            elementsOptions: {appearance: {theme: 'night'}},
+          }}
+        />
+      );
+    });
+
+    await waitFor(() => {
+      expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+      expect(mockCheckoutSdk.changeAppearance).toHaveBeenCalledTimes(1);
+      expect(mockCheckoutSdk.changeAppearance).toHaveBeenCalledWith({
+        theme: 'night',
+      });
+    });
+  });
+
+  test('it does not call loadFonts a 2nd time if they do not change', async () => {
+    let result: any;
+    act(() => {
+      result = render(
+        <CheckoutElementsProvider
+          stripe={mockStripe}
+          options={{
+            clientSecret: fakeClientSecret,
+            elementsOptions: {
+              fonts: [
+                {
+                  cssSrc: 'https://example.com/font.css',
+                },
+              ],
+            },
+          }}
+        />
+      );
+    });
+
+    await waitFor(() =>
+      expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledWith({
+        clientSecret: fakeClientSecret,
+        elementsOptions: {
+          fonts: [
+            {
+              cssSrc: 'https://example.com/font.css',
+            },
+          ],
+        },
+      })
+    );
+
+    act(() => {
+      result.rerender(
+        <CheckoutElementsProvider
+          stripe={mockStripe}
+          options={{
+            clientSecret: fakeClientSecret,
+            elementsOptions: {
+              fonts: [
+                {
+                  cssSrc: 'https://example.com/font.css',
+                },
+              ],
+            },
+          }}
+        />
+      );
+    });
+
+    act(() => {
+      result.rerender(
+        <CheckoutElementsProvider
+          stripe={mockStripe}
+          options={{
+            clientSecret: fakeClientSecret,
+            elementsOptions: {
+              fonts: [
+                {
+                  cssSrc: 'https://example.com/font.css',
+                },
+              ],
+            },
+          }}
+        />
+      );
+    });
+
+    await waitFor(() => {
+      expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+      expect(mockCheckoutSdk.loadFonts).toHaveBeenCalledTimes(0);
+    });
+  });
+
+  test('allows changes to elementsOptions fonts', async () => {
+    let result: any;
+    act(() => {
+      result = render(
+        <CheckoutElementsProvider
+          stripe={mockStripe}
+          options={{
+            clientSecret: fakeClientSecret,
+            elementsOptions: {},
+          }}
+        />
+      );
+    });
+
+    await waitFor(() =>
+      expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledWith({
+        clientSecret: fakeClientSecret,
+        elementsOptions: {},
+      })
+    );
+
+    act(() => {
+      result.rerender(
+        <CheckoutElementsProvider
+          stripe={mockStripe}
+          options={{
+            clientSecret: fakeClientSecret,
+            elementsOptions: {
+              fonts: [
+                {
+                  cssSrc: 'https://example.com/font.css',
+                },
+              ],
+            },
+          }}
+        />
+      );
+    });
+
+    await waitFor(() => {
+      expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+      expect(mockCheckoutSdk.loadFonts).toHaveBeenCalledTimes(1);
+      expect(mockCheckoutSdk.loadFonts).toHaveBeenCalledWith([
+        {
+          cssSrc: 'https://example.com/font.css',
+        },
+      ]);
+    });
+  });
+
+  it('allows options changes before setting the Stripe object', async () => {
+    const result = render(
+      <CheckoutElementsProvider
+        stripe={null}
+        options={{
+          clientSecret: fakeClientSecret,
+          elementsOptions: {
+            appearance: {theme: 'stripe'},
+          },
+        }}
+      />
+    );
+
+    await waitFor(() =>
+      expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(0)
+    );
+
+    act(() => {
+      result.rerender(
+        <CheckoutElementsProvider
+          stripe={mockStripe}
+          options={{
+            clientSecret: fakeClientSecret,
+            elementsOptions: {appearance: {theme: 'stripe'}},
+          }}
+        />
+      );
+    });
+
+    await waitFor(() => {
+      expect(console.warn).not.toHaveBeenCalled();
+      expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+      expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledWith({
+        clientSecret: fakeClientSecret,
+        elementsOptions: {
+          appearance: {theme: 'stripe'},
+        },
+      });
+    });
+  });
+
+  describe('React.StrictMode', () => {
+    test('initCheckoutElementsSdk once in StrictMode', async () => {
+      const TestComponent = () => {
+        useCheckout();
+        return <div />;
+      };
+
+      act(() => {
+        render(
+          <StrictMode>
+            <CheckoutElementsProvider
+              stripe={mockStripe}
+              options={{clientSecret: fakeClientSecret}}
+            >
+              <TestComponent />
+            </CheckoutElementsProvider>
+          </StrictMode>
+        );
+      });
+
+      await waitFor(() =>
+        expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1)
+      );
+    });
+
+    test('initCheckoutElementsSdk once with stripePromise in StrictMode', async () => {
+      const TestComponent = () => {
+        useCheckout();
+        return <div />;
+      };
+
+      act(() => {
+        render(
+          <StrictMode>
+            <CheckoutElementsProvider
+              stripe={mockStripePromise}
+              options={{clientSecret: fakeClientSecret}}
+            >
+              <TestComponent />
+            </CheckoutElementsProvider>
+          </StrictMode>
+        );
+      });
+
+      await waitFor(() =>
+        expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1)
+      );
+    });
+
+    test('allows changes to options via changeAppearance after setting the Stripe object in StrictMode', async () => {
+      let result: any;
+      act(() => {
+        result = render(
+          <StrictMode>
+            <CheckoutElementsProvider
+              stripe={mockStripe}
+              options={{
+                clientSecret: fakeClientSecret,
+                elementsOptions: {
+                  appearance: {theme: 'stripe'},
+                },
+              }}
+            />
+          </StrictMode>
+        );
+      });
+
+      await waitFor(() => {
+        expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledTimes(1);
+        expect(mockStripe.initCheckoutElementsSdk).toHaveBeenCalledWith({
+          clientSecret: fakeClientSecret,
+          elementsOptions: {
+            appearance: {theme: 'stripe'},
+          },
+        });
+      });
+
+      act(() => {
+        result.rerender(
+          <StrictMode>
+            <CheckoutElementsProvider
+              stripe={mockStripe}
+              options={{
+                clientSecret: fakeClientSecret,
+                elementsOptions: {appearance: {theme: 'night'}},
+              }}
+            />
+          </StrictMode>
+        );
+      });
+
+      await waitFor(() => {
+        expect(mockCheckoutSdk.changeAppearance).toHaveBeenCalledTimes(1);
+        expect(mockCheckoutSdk.changeAppearance).toHaveBeenCalledWith({
+          theme: 'night',
+        });
+      });
+    });
+  });
+
+  describe('providers <> hooks', () => {
+    afterEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('throws when trying to call useCheckout outside of CheckoutProvider context', () => {
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      expect(() => {
+        renderHook(() => useCheckout());
+      }).toThrow(
+        'Could not find checkout context; You need to wrap the part of your app that calls useCheckout() in a <CheckoutElementsProvider> or <CheckoutFormProvider> provider.'
+      );
+    });
+
+    it('throws when trying to call useStripe outside of CheckoutProvider context', () => {
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      expect(() => {
+        renderHook(() => useStripe());
+      }).toThrow(
+        'Could not find Elements context; You need to wrap the part of your app that calls useStripe() in an <Elements> provider.'
+      );
+    });
+
+    it('throws when trying to call useStripe in Elements -> CheckoutProvider nested context', async () => {
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      const wrapper = ({children}: any) => (
+        <Elements stripe={mockStripe}>
+          <CheckoutElementsProvider
+            stripe={mockStripe}
+            options={{clientSecret: fakeClientSecret}}
+          >
+            {children}
+          </CheckoutElementsProvider>
+        </Elements>
+      );
+
+      expect(() => {
+        renderHook(() => useStripe(), {
+          wrapper,
+        });
+      }).toThrow(
+        'You cannot wrap the part of your app that calls useStripe() in both a checkout provider and <Elements> provider.'
+      );
+    });
+
+    it('throws when trying to call useStripe in CheckoutProvider -> Elements nested context', async () => {
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      const wrapper = ({children}: any) => (
+        <CheckoutElementsProvider
+          stripe={mockStripe}
+          options={{clientSecret: fakeClientSecret}}
+        >
+          <Elements stripe={mockStripe}>{children}</Elements>
+        </CheckoutElementsProvider>
+      );
+
+      expect(() => {
+        renderHook(() => useStripe(), {
+          wrapper,
+        });
+      }).toThrow(
+        'You cannot wrap the part of your app that calls useStripe() in both a checkout provider and <Elements> provider.'
+      );
+    });
+  });
+});
